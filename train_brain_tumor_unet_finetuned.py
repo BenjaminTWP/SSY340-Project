@@ -8,7 +8,8 @@ from torchvision.transforms import functional as F
 from pycocotools.coco import COCO
 import segmentation_models_pytorch as smp
 from tqdm.notebook import tqdm
-import json
+from matplotlib.patches import Patch
+
 
 """
 Custom Dataset
@@ -27,7 +28,7 @@ class BrainTumorDataset(Dataset):
         img_id = self.image_ids[idx]
         img_info = self.coco.loadImgs(img_id)[0]
         img_path = os.path.join(self.root_dir, img_info["file_name"])
-        image = Image.open(img_path).convert("RGB")
+        image = Image.open(img_path).convert("RGB")  # Since imagenet has 3 channels (RGB)
 
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         anns = self.coco.loadAnns(ann_ids)
@@ -40,7 +41,7 @@ class BrainTumorDataset(Dataset):
 
         image = F.to_tensor(image)
         mask = torch.as_tensor(mask, dtype=torch.long)
-        return image, mask
+        return image, mask, img_info['file_name']
 
 
 """
@@ -135,9 +136,97 @@ def validate(model, dataloader, criterion, device):
     return val_loss/n, val_dice/n, val_iou/n, val_acc/n
 
 
-def test_model(model, dataloader, device):
-    
-    return 
+"""
+Function for testing model on test-set and save results
+"""
+def test_model(model, dataloader, device, save_results=True, save_dir="test_results"):
+    model.eval()
+    criterion = torch.nn.CrossEntropyLoss()
+
+    test_loss, test_dice, test_iou, test_acc = 0.0, 0.0, 0.0, 0.0
+
+    if save_results:
+        os.makedirs(save_dir, exist_ok=True)
+
+    # Disable gradient computation for testing
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=True):
+        for batch_idx, (images, masks, file_names) in enumerate(tqdm(dataloader, desc="Testing", leave=False)):
+            images = images.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True)
+
+            outputs = model(images)
+
+            # Upsample predictions to match target size
+            if outputs.shape[-2:] != masks.shape[-2:]:
+                outputs = F.interpolate(outputs, 
+                                        size=masks.shape[-2:],
+                                        mode="bilinear",
+                                        align_corners=False)
+
+            # Compute metrics 
+            loss = criterion(outputs, masks)
+            dice = dice_score(outputs, masks)
+            iou = iou_score(outputs, masks)
+            acc = accuracy_score(outputs, masks)
+
+            test_loss += loss.item()
+            test_dice += dice
+            test_iou += iou
+            test_acc += acc
+
+            # Save example images/predictions (first few batches)
+            if save_results and batch_idx < 5:
+                preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                imgs = images.cpu().permute(0, 2, 3, 1).numpy()
+                masks_gt = masks.cpu().numpy()
+
+                for i in range(len(preds)):
+                    img = imgs[i]
+                    gt = masks_gt[i]
+                    pred = preds[i]
+                    file_name = os.path.splitext(file_names[i])[0]
+
+                    # Normalize for image
+                    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+
+                    fig, ax = plt.subplots(figsize=(5, 5))
+                    ax.imshow(img, cmap="gray")
+
+                    # Overlay ground truth (green)
+                    gt_overlay = (gt>0).astype(float)
+                    ax.imshow(np.ma.masked_where(gt_overlay == 0, gt_overlay), cmap="Greens", alpha=0.4)
+
+                    # Overlay prediction (red)
+                    pred_overlay = (pred>0).astype(float)
+                    ax.imshow(np.ma.masked_where(pred_overlay == 0, pred_overlay), cmap="Reds", alpha=0.4)
+
+                    ax.set_title(f"Ground Truth (green) vs Predicted (red)")
+                    ax.axis("off")
+
+                    legend_elements = [
+                        Patch(facecolor='green', edgecolor='none', alpha=0.4, label='Ground Truth'),
+                        Patch(facecolor='red', edgecolor='none', alpha=0.4, label='Prediction')
+                    ]
+                    ax.legend(handles=legend_elements, loc='lower right', fontsize=8)
+
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(save_dir, f"{file_name}_overlay.png"), dpi=150)
+                    plt.close(fig)
+
+    # Average metrics
+    n = len(dataloader)
+    test_loss /= n
+    test_dice /= n
+    test_iou  /= n
+    test_acc  /= n
+
+    print("\n=== Test Results ===")
+    print(f"Loss: {test_loss:.4f}")
+    print(f"Dice Score: {test_dice:.4f}")
+    print(f"IoU Score: {test_iou:.4f}")
+    print(f"Accuracy: {test_acc:.4f}")
+
+    return test_loss, test_dice, test_iou, test_acc
 
 
 def main():
@@ -173,7 +262,7 @@ def main():
         if "layer4" in name:
             param.requires_grad = True
 
-    # Keep batchnorm layers trainable (don't know if this made it better)
+    # Keep batchnorm layers trainable
     for m in model.modules():
         if isinstance(m, torch.nn.BatchNorm2d):
             m.train()
@@ -190,7 +279,7 @@ def main():
         "train_acc": [], "val_acc": []
     }
 
-    print("\n=== Fine-tuning encoder ===")
+    print("\n Fine-tuning encoder")
     for epoch in range(fine_tune_epochs):
         print(f"\nEpoch [{epoch+1}/{fine_tune_epochs}]")
         t_loss, t_dice, t_iou, t_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler)
@@ -212,6 +301,15 @@ def main():
     # Save fine-tuned model
     torch.save(model.state_dict(), "unet_finetuned.pth")
     print("\n Fine-tuning complete. Model saved as 'unet_finetuned.pth'")
+
+    # Test
+    test_dataset = BrainTumorDataset(root_dir=dataset_root, split="test")
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers, pin_memory=True)
+
+    print("\n Evaluating on Test Set")
+    model.load_state_dict(torch.load("unet_finetuned.pth", map_location=device))
+    test_model(model, test_loader, device)
 
     epochs = range(1, fine_tune_epochs + 1)
 
